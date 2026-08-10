@@ -49,10 +49,13 @@ func TestNormalizeCodexParallelToolCalls_ResponsesLiteMetadataForcesFalse(t *tes
 	if !parallelToolCalls.Exists() || parallelToolCalls.Bool() {
 		t.Fatalf("responses-lite parallel_tool_calls should be false: %s", string(out))
 	}
+	if got := gjson.GetBytes(out, "reasoning.context").String(); got != "all_turns" {
+		t.Fatalf("responses-lite reasoning.context = %q, want all_turns: %s", got, string(out))
+	}
 }
 
 func TestNormalizeCodexParallelToolCalls_ResponsesLiteHeaderForcesFalse(t *testing.T) {
-	body := []byte(`{"model":"gpt-5.6-luna","parallel_tool_calls":true,"input":"hi"}`)
+	body := []byte(`{"model":"gpt-5.6-luna","parallel_tool_calls":true,"reasoning":{"context":"current_turn"},"input":"hi"}`)
 	headers := make(http.Header)
 	headers.Set(codexResponsesLiteHeader, "true")
 
@@ -61,5 +64,18 @@ func TestNormalizeCodexParallelToolCalls_ResponsesLiteHeaderForcesFalse(t *testi
 	parallelToolCalls := gjson.GetBytes(out, "parallel_tool_calls")
 	if !parallelToolCalls.Exists() || parallelToolCalls.Bool() {
 		t.Fatalf("responses-lite parallel_tool_calls should be false: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning.context").String(); got != "all_turns" {
+		t.Fatalf("responses-lite reasoning.context = %q, want all_turns: %s", got, string(out))
+	}
+}
+
+func TestNormalizeCodexResponsesLiteRequest_NonLitePreservesReasoningContext(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-luna","reasoning":{"context":"current_turn"},"input":"hi"}`)
+
+	out := normalizeCodexResponsesLiteRequest(body, nil)
+
+	if string(out) != string(body) {
+		t.Fatalf("non-lite request changed: %s", string(out))
 	}
 }

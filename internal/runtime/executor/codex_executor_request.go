@@ -424,6 +424,16 @@ func isCodexResponsesLiteRequest(body []byte, headers http.Header) bool {
 	return value.Type == gjson.True || value.Type == gjson.String && strings.EqualFold(strings.TrimSpace(value.String()), "true")
 }
 
+func normalizeCodexResponsesLiteRequest(body []byte, headers http.Header) []byte {
+	if !isCodexResponsesLiteRequest(body, headers) {
+		return body
+	}
+	// Responses Lite requires both fields on every request, including websocket prewarm frames.
+	body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
+	body = helps.SetStringIfDifferent(body, "reasoning.context", "all_turns")
+	return body
+}
+
 func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
 	if isCodexResponsesLiteRequest(body, headers) {
 		return body
@@ -451,8 +461,7 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 
 func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {
 	if isCodexResponsesLiteRequest(body, headers) {
-		body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
-		return body
+		return normalizeCodexResponsesLiteRequest(body, headers)
 	}
 	return normalizeCodexParallelToolCallsForTools(body)
 }

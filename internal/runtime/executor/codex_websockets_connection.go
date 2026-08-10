@@ -97,11 +97,7 @@ func mapCodexWebsocketReadError(err error) error {
 }
 
 func normalizeCodexWebsocketParallelToolCalls(body []byte, headers http.Header) []byte {
-	if !isCodexResponsesLiteRequest(body, headers) {
-		return body
-	}
-	body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
-	return body
+	return normalizeCodexResponsesLiteRequest(body, headers)
 }
 
 func buildCodexWebsocketRequestBody(body []byte) []byte {

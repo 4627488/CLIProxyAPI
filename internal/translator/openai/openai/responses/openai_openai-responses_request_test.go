@@ -190,6 +190,62 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringified
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedCustomToolOutputImages(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"custom_tool_call","call_id":"call_image","name":"view_image","input":"{}"},
+			{"type":"custom_tool_call_output","call_id":"call_image","output":"[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,AA==\",\"detail\":\"original\"}]"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+	content := gjson.GetBytes(out, "messages.1.content")
+	if !content.IsArray() {
+		t.Fatalf("expected custom tool content array, got %s; output=%s", content.Raw, out)
+	}
+	if got := content.Get("0.type").String(); got != "image_url" {
+		t.Fatalf("image type = %q, want image_url; output=%s", got, out)
+	}
+	if got := content.Get("0.image_url.url").String(); got != "data:image/png;base64,AA==" {
+		t.Fatalf("image URL = %q, want data URL; output=%s", got, out)
+	}
+	if got := content.Get("0.image_url.detail").String(); got != "high" {
+		t.Fatalf("image detail = %q, want high; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesCustomToolOutputFallbacks(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected string
+	}{
+		{name: "plain text", output: `"plain output"`, expected: "plain output"},
+		{name: "text content array", output: `[{"type":"input_text","text":"done"}]`, expected: "done"},
+		{name: "invalid image array", output: `[{"type":"input_image","detail":"low"}]`, expected: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{
+				"input": [
+					{"type":"custom_tool_call","call_id":"call_output","name":"inspect","input":"{}"},
+					{"type":"custom_tool_call_output","call_id":"call_output","output":%s}
+				]
+			}`, tt.output))
+
+			out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+			content := gjson.GetBytes(out, "messages.1.content")
+			if content.Type != gjson.String {
+				t.Fatalf("expected custom tool content string, got %s; output=%s", content.Raw, out)
+			}
+			if got := content.String(); got != tt.expected {
+				t.Fatalf("custom tool content = %q, want %q; output=%s", got, tt.expected, out)
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ConvertsStructuredToolOutputImages(t *testing.T) {
 	raw := []byte(`{
 		"input": [
@@ -296,6 +352,119 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_AttachesReasoningT
 	}
 	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
 		t.Fatalf("messages.1.role = %q, want user; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_PreservesAssistantContentWithToolCalls(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{
+				"type": "reasoning",
+				"id": "rs_1",
+				"summary": [{"type": "summary_text", "text": "inspect the next step"}]
+			},
+			{
+				"type": "message",
+				"role": "assistant",
+				"content": [{"type": "output_text", "text": "Step 3 completed; continue to step 4."}]
+			},
+			{"type":"function_call","call_id":"call_4","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
+			{"type":"function_call_output","call_id":"call_4","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	if got := len(messages); got != 2 {
+		t.Fatalf("messages count = %d, want 2; output=%s", got, out)
+	}
+	assistant := messages[0]
+	if got := assistant.Get("role").String(); got != "assistant" {
+		t.Fatalf("assistant role = %q, want assistant; output=%s", got, out)
+	}
+	if got := assistant.Get("reasoning_content").String(); got != "inspect the next step" {
+		t.Fatalf("assistant reasoning_content = %q, want inspect the next step; output=%s", got, out)
+	}
+	if got := assistant.Get("content.0.text").String(); got != "Step 3 completed; continue to step 4." {
+		t.Fatalf("assistant content = %q, want preserved text; output=%s", got, out)
+	}
+	if got := assistant.Get("tool_calls.0.id").String(); got != "call_4" {
+		t.Fatalf("assistant tool call ID = %q, want call_4; output=%s", got, out)
+	}
+	if got := messages[1].Get("tool_call_id").String(); got != "call_4" {
+		t.Fatalf("tool output call ID = %q, want call_4; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DoesNotMergeToolCallsAcrossUserMessage(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]},
+			{"type":"function_call","call_id":"call_next","name":"exec_command","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_next","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	if got := len(messages); got != 4 {
+		t.Fatalf("messages count = %d, want 4; output=%s", got, out)
+	}
+	if messages[0].Get("tool_calls").Exists() {
+		t.Fatalf("messages.0 unexpectedly contains tool calls; output=%s", out)
+	}
+	if got := messages[1].Get("role").String(); got != "user" {
+		t.Fatalf("messages.1 role = %q, want user; output=%s", got, out)
+	}
+	if got := messages[2].Get("tool_calls.0.id").String(); got != "call_next" {
+		t.Fatalf("messages.2 tool call ID = %q, want call_next; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MergesDistinctReasoningWithinAssistantTurn(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"first"}]},
+			{"type":"message","role":"assistant","reasoning_content":"first","content":[{"type":"output_text","text":"working"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},
+			{"type":"function_call","call_id":"call_reasoning","name":"exec_command","arguments":"{}"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	if got := len(messages); got != 1 {
+		t.Fatalf("messages count = %d, want 1; output=%s", got, out)
+	}
+	if got := messages[0].Get("reasoning_content").String(); got != "first\n\nsecond" {
+		t.Fatalf("reasoning_content = %q, want %q; output=%s", got, "first\n\nsecond", out)
+	}
+	if got := messages[0].Get("tool_calls.0.id").String(); got != "call_reasoning" {
+		t.Fatalf("tool call ID = %q, want call_reasoning; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReplacesUnavailableReasoningWithinAssistantTurn(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"reasoning","summary":[]},
+			{"type":"message","role":"assistant","reasoning_content":"real reasoning","content":[{"type":"output_text","text":"working"}]},
+			{"type":"function_call","call_id":"call_real_reasoning","name":"exec_command","arguments":"{}"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	if got := len(messages); got != 1 {
+		t.Fatalf("messages count = %d, want 1; output=%s", got, out)
+	}
+	if got := messages[0].Get("reasoning_content").String(); got != "real reasoning" {
+		t.Fatalf("reasoning_content = %q, want real reasoning; output=%s", got, out)
 	}
 }
 

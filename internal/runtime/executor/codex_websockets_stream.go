@@ -61,6 +61,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
 	body = normalizeCodexWebsocketParallelToolCalls(body, opts.Headers)
+	multiAgentV2Conflict := helps.HasCodexMultiAgentV2NamespaceConflict(body)
 	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuth(ctx, opts.Headers, body, e.cfg, auth, baseModel)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
@@ -183,6 +184,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if sess != nil {
 		readCh = sess.activate(conn)
 	}
+	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		errSend = mapCodexWebsocketWriteError(sess, conn, errSend)
@@ -197,7 +199,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
 			if !shouldRetryCodexWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
@@ -223,6 +225,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return nil, errBind
 			}
 			readCh = sess.activate(conn)
+			restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
 			wsReqBodyRetry := buildCodexWebsocketRequestBody(upstreamBody)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
@@ -240,7 +243,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
 				errSendRetry = mapCodexWebsocketWriteError(sess, conn, errSendRetry)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
-				e.invalidateUpstreamConn(sess, conn, "send_error", errSendRetry)
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSendRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
 				return nil, errSendRetry
@@ -253,6 +256,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			return nil, errSend
 		}
+	}
+
+	if optimizeMultiAgentV2 || multiAgentV2Conflict {
+		sess.setMultiAgentV2Optimized(conn, optimizeMultiAgentV2 && !multiAgentV2Conflict)
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -321,7 +328,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
 					reporter.PublishFailure(ctx, err)
 					if sess != nil {
-						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
+						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "unexpected_binary", err)
 					}
 					_ = send(cliproxyexecutor.StreamChunk{Err: err})
 					return
@@ -336,13 +343,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			reporter.MarkFirstResponseByte()
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
-			payload = helps.RestoreCodexMultiAgentV2Response(payload, optimizeMultiAgentV2)
+			payload = helps.RestoreCodexMultiAgentV2Response(payload, restoreMultiAgentV2)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_error", wsErr)
 				}
 				if errClearReplay := clearCodexReasoningReplayOnWebsocketError(ctx, replayScope, payload); errClearReplay != nil {
 					terminateErr = errClearReplay
@@ -361,7 +368,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateErr = streamErr
 				if sess != nil {
 					unlockStreamSession()
-					e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "terminal_failure", streamErr)
 				}
 				if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 					terminateErr = errClearReplay

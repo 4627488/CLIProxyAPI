@@ -2681,6 +2681,26 @@
   ],
   "xai": [
     {
+      "id": "grok-4.6",
+      "object": "model",
+      "created": 1786492800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.6",
+      "name": "grok-4.6",
+      "description": "SpaceXAI's flagship model for coding, agentic tool use, and general knowledge work.",
+      "context_length": 500000,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
       "id": "grok-build-0.1",
       "object": "model",
       "created": 1779321600,

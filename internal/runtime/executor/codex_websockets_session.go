@@ -12,6 +12,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 type codexWebsocketSessionStore struct {
@@ -548,23 +549,27 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	if e == nil || sess == nil || conn == nil {
 		return
 	}
+	lastMessageTerminal := false
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			invalidate := func() {
-				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
-			}
-			invalidated := false
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				invalidate := func() {
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_disconnected", errRead)
+				}
+				invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
-			}
-			if !invalidated {
-				invalidate()
+				if !invalidated {
+					invalidate()
+				}
+			} else if lastMessageTerminal {
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_disconnected_after_terminal", errRead)
+			} else {
+				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			}
 			return
 		}
@@ -572,19 +577,20 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
-				invalidate := func() {
-					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
-				}
-				invalidated := false
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
+					invalidate := func() {
+						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "unexpected_binary", errBinary)
+					}
+					invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
 					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
-				}
-				if !invalidated {
-					invalidate()
+					if !invalidated {
+						invalidate()
+					}
+				} else {
+					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				}
 				return
 			}
@@ -592,6 +598,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		}
 
 		ch, done := sess.activeForConn(conn)
+		lastMessageTerminal = isTerminalUpstreamWebsocketPayload(payload)
 		if ch == nil {
 			continue
 		}
@@ -599,6 +606,15 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
 		case <-done:
 		}
+	}
+}
+
+func isTerminalUpstreamWebsocketPayload(payload []byte) bool {
+	switch strings.TrimSpace(gjson.GetBytes(payload, "type").String()) {
+	case "error", "response.completed", "response.done", "response.incomplete", "response.failed":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -525,6 +525,93 @@ func TestWebsocketExecutorsReconnectWhenSessionTargetChanges(t *testing.T) {
 	})
 }
 
+func TestActiveWebsocketDisconnectStaysOnOrderedTurnChannel(t *testing.T) {
+	t.Run("Codex", func(t *testing.T) {
+		exec := NewCodexWebsocketsExecutor(&config.Config{})
+		exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+		testActiveWebsocketDisconnectStaysOnOrderedTurnChannel(
+			t,
+			exec.UpstreamDisconnectChan,
+			exec.getOrCreateSession,
+			exec.readUpstreamLoop,
+		)
+	})
+
+	t.Run("xAI", func(t *testing.T) {
+		exec := NewXAIWebsocketsExecutor(&config.Config{})
+		exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+		testActiveWebsocketDisconnectStaysOnOrderedTurnChannel(
+			t,
+			exec.UpstreamDisconnectChan,
+			exec.getOrCreateSession,
+			exec.readUpstreamLoop,
+		)
+	})
+}
+
+func testActiveWebsocketDisconnectStaysOnOrderedTurnChannel(
+	t *testing.T,
+	disconnectChan func(string) <-chan error,
+	getSession func(string) *codexWebsocketSession,
+	readLoop func(*codexWebsocketSession, *websocket.Conn),
+) {
+	t.Helper()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read trigger: %v", errRead)
+			return
+		}
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer server.Close()
+
+	conn, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	sessionID := "active-disconnect"
+	idleDisconnect := disconnectChan(sessionID)
+	sess := getSession(sessionID)
+	if sess == nil || idleDisconnect == nil {
+		t.Fatal("expected websocket session and disconnect channel")
+	}
+	sess.connMu.Lock()
+	sess.conn = conn
+	sess.authID = "auth"
+	sess.wsURL = server.URL
+	sess.readerConn = conn
+	sess.connMu.Unlock()
+	turnReads := sess.activate(conn)
+	go readLoop(sess, conn)
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`)); errWrite != nil {
+		t.Fatalf("write trigger: %v", errWrite)
+	}
+	select {
+	case event, ok := <-turnReads:
+		if !ok || event.err == nil {
+			t.Fatalf("ordered turn event = %#v, open=%v", event, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ordered disconnect event")
+	}
+
+	select {
+	case errDisconnect := <-idleDisconnect:
+		t.Fatalf("active disconnect raced onto idle notification channel: %v", errDisconnect)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func testWebsocketExecutorReconnectsWhenSessionTargetChanges(
 	t *testing.T,
 	disconnectChan func(string) <-chan error,

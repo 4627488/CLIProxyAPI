@@ -505,6 +505,9 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	usageOK := false
 	if hasUsageCandidate {
 		usageNode := gjson.GetBytes(payload, "usage")
+		if !hasOpenAIStyleUsageTokenFields(usageNode) {
+			usageNode = gjson.GetBytes(payload, "response.usage")
+		}
 		if hasOpenAIStyleUsageTokenFields(usageNode) {
 			detail = parseOpenAIStyleUsageNode(usageNode)
 			usageOK = true

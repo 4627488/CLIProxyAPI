@@ -596,7 +596,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				}
 				return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 			}
-			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
+			e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
 			if !shouldRetryXAIWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
@@ -642,7 +642,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			if errSendRetry := writeCodexWebsocketMessage(sess, conn, wsReqBodyRetry); errSendRetry != nil {
 				errSendRetry = mapXAIWebsocketWriteError(sess, connRetry, errSendRetry)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
-				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
 				return nil, errSendRetry
@@ -731,7 +731,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", errBinary)
 					reporter.PublishFailure(ctx, errBinary)
 					if sess != nil {
-						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
+						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "unexpected_binary", errBinary)
 					}
 					_ = send(cliproxyexecutor.StreamChunk{Err: errBinary})
 					return
@@ -1219,22 +1219,26 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 	if e == nil || sess == nil || conn == nil {
 		return
 	}
+	lastMessageTerminal := false
 	for {
 		msgType, payload, errRead := conn.ReadMessage()
 		if errRead != nil {
-			invalidate := func() {
-				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
-			}
-			invalidated := false
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				invalidate := func() {
+					e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_disconnected", errRead)
+				}
+				invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
-			}
-			if !invalidated {
-				invalidate()
+				if !invalidated {
+					invalidate()
+				}
+			} else if lastMessageTerminal {
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "upstream_disconnected_after_terminal", errRead)
+			} else {
+				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			}
 			return
 		}
@@ -1242,19 +1246,20 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				errBinary := fmt.Errorf("xai websockets executor: unexpected binary message")
-				invalidate := func() {
-					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
-				}
-				invalidated := false
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
+					invalidate := func() {
+						e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "unexpected_binary", errBinary)
+					}
+					invalidated := sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
 					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
-				}
-				if !invalidated {
-					invalidate()
+					if !invalidated {
+						invalidate()
+					}
+				} else {
+					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				}
 				return
 			}
@@ -1262,6 +1267,7 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 		}
 
 		ch, done := sess.activeForConn(conn)
+		lastMessageTerminal = isTerminalUpstreamWebsocketPayload(payload)
 		if ch == nil {
 			continue
 		}

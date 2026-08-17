@@ -108,7 +108,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt == "responses/compact" {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses/compact"
-	} else if openAICompatUsesResponses(auth) {
+	} else if openAICompatUsesResponses(auth, opts) {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses"
 	}
@@ -161,6 +161,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+	applyOpenAICompatProviderHeaders(httpReq, auth, endpoint)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -205,6 +206,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+	if endpoint == "/responses" {
+		recordOpenAICompatResponseAffinityID(opts.Metadata, body)
+	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
@@ -327,7 +331,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
-	if openAICompatUsesResponses(auth) {
+	if openAICompatUsesResponses(auth, opts) {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses"
 	}
@@ -382,6 +386,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+	applyOpenAICompatProviderHeaders(httpReq, auth, endpoint)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
 	var authID, authLabel, authType, authValue string
@@ -486,6 +491,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				return true
 			}
 			if !isDone {
+				if endpoint == "/responses" {
+					recordOpenAICompatResponseAffinityID(opts.Metadata, dataPayload)
+				}
 				if streamErr, isError := openAICompatStreamDataError(dataPayload, eventName); isError {
 					publishStreamError(streamErr, true)
 					return true
@@ -582,11 +590,50 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
-func openAICompatUsesResponses(auth *cliproxyauth.Auth) bool {
+func openAICompatUsesResponses(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) bool {
 	if auth == nil || auth.Attributes == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(auth.Attributes["upstream_api"]), "responses")
+	switch strings.ToLower(strings.TrimSpace(auth.Attributes["upstream_api"])) {
+	case "responses":
+		return true
+	case "auto":
+		return opts.SourceFormat == sdktranslator.FormatOpenAIResponse || opts.SourceFormat == sdktranslator.FormatCodex || opts.Alt == "responses/compact"
+	default:
+		return false
+	}
+}
+
+func applyOpenAICompatProviderHeaders(req *http.Request, auth *cliproxyauth.Auth, endpoint string) {
+	if req == nil || auth == nil || auth.Attributes == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Attributes["vendor"]), "aliyun-bailian") {
+		return
+	}
+	cacheMode := strings.ToLower(strings.TrimSpace(auth.Attributes["cache_mode"]))
+	if cacheMode == "" {
+		cacheMode = "auto"
+	}
+	if endpoint == "/responses" && (cacheMode == "auto" || cacheMode == "session") {
+		req.Header.Set("x-dashscope-session-cache", "enable")
+		return
+	}
+	// A per-credential cache policy must override a stale custom header.
+	req.Header.Del("x-dashscope-session-cache")
+}
+
+func recordOpenAICompatResponseAffinityID(metadata map[string]any, payload []byte) {
+	if metadata == nil || len(payload) == 0 {
+		return
+	}
+	for _, path := range []string{"response.id", "id"} {
+		responseID := strings.TrimSpace(gjson.GetBytes(payload, path).String())
+		if responseID != "" {
+			metadata[cliproxyexecutor.ResponseAffinityIDMetadataKey] = responseID
+			return
+		}
+	}
 }
 
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {

@@ -54,6 +54,11 @@ const (
 	SessionAffinityProviderMetadataKey = "session_affinity_provider"
 	// SessionAffinityModelMetadataKey carries the model used during session affinity selection.
 	SessionAffinityModelMetadataKey = "session_affinity_model"
+	// ResponseAffinityIDMetadataKey carries a stateful upstream response ID discovered by an executor.
+	// SessionAffinitySelector binds it to the selected credential after a successful request.
+	ResponseAffinityIDMetadataKey = "response_affinity_id"
+	// SessionAffinityStatusMetadataKey describes how session affinity affected credential selection.
+	SessionAffinityStatusMetadataKey = "session_affinity_status"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

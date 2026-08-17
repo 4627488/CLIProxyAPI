@@ -610,14 +610,18 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback      Selector
+	cache         *SessionCache
+	authAttribute string
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
+	Fallback      Selector
+	TTL           time.Duration
+	// AuthAttribute limits affinity to candidate pools where at least one auth
+	// explicitly enables the named boolean attribute. Empty enables all pools.
+	AuthAttribute string
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -637,8 +641,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cfg.TTL = time.Hour
 	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:      cfg.Fallback,
+		cache:         NewSessionCache(cfg.TTL),
+		authAttribute: strings.TrimSpace(cfg.AuthAttribute),
 	}
 }
 
@@ -661,6 +666,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+	if !s.enabledForAuths(auths) {
+		opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "disabled"
+		available, errAvailable := getAvailableAuths(auths, provider, model, time.Now())
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
+		return s.fallback.Pick(ctx, provider, model, opts, available)
+	}
+	if responseID := previousResponseAffinityID(opts.OriginalRequest); responseID != "" {
+		return s.pickResponseAffinity(entry, provider, model, responseID, opts, auths)
+	}
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
 	availabilityCandidates := auths
@@ -668,6 +684,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
+		opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "none"
 		fallbackAuths, errAvailable := getAvailableAuths(availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
@@ -702,6 +719,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				bind(auth.ID)
+				opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "hit"
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -712,6 +730,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, err
 		}
 		bind(auth.ID)
+		opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "rebound"
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -721,6 +740,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
 					bind(auth.ID)
+					opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "alias_hit"
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -733,8 +753,82 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	bind(auth.ID)
+	opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "miss"
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) enabledForAuths(auths []*Auth) bool {
+	if s == nil || s.authAttribute == "" {
+		return true
+	}
+	for _, auth := range auths {
+		if auth == nil || auth.Attributes == nil {
+			continue
+		}
+		value := strings.ToLower(strings.TrimSpace(auth.Attributes[s.authAttribute]))
+		if value == "true" || value == "1" || value == "yes" || value == "on" {
+			return true
+		}
+	}
+	return false
+}
+
+// pickResponseAffinity resolves stateful Responses continuations strictly. A
+// previous_response_id belongs to the credential that created it, so falling
+// back to another credential would turn a routing miss into an upstream 400.
+func (s *SessionAffinitySelector) pickResponseAffinity(entry *log.Entry, provider, model, responseID string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	modelKey := canonicalModelKey(model)
+	cacheKey := responseAffinityCacheKey(provider, responseID, modelKey)
+	cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey)
+	if !ok {
+		if len(auths) == 1 {
+			available, errAvailable := getAvailableAuthsAcrossPriorities(auths, provider, model, time.Now())
+			if errAvailable == nil && len(available) == 1 {
+				opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "response_singleton"
+				return available[0], nil
+			}
+		}
+		opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "response_miss"
+		return nil, &Error{
+			Code:    "previous_response_affinity_missing",
+			Message: "previous_response_id is not bound to an available upstream credential; resend the full conversation",
+		}
+	}
+
+	available, errAvailable := getAvailableAuthsAcrossPriorities(auths, provider, model, time.Now())
+	if errAvailable != nil {
+		opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "response_unavailable"
+		return nil, &Error{
+			Code:    "previous_response_affinity_unavailable",
+			Message: "the upstream credential that owns previous_response_id is unavailable",
+		}
+	}
+	for _, auth := range available {
+		if auth.ID != cachedAuthID {
+			continue
+		}
+		opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "response_hit"
+		entry.Infof("session-affinity: response cache hit | auth=%s provider=%s model=%s", auth.ID, provider, model)
+		return auth, nil
+	}
+
+	opts.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey] = "response_unavailable"
+	return nil, &Error{
+		Code:    "previous_response_affinity_unavailable",
+		Message: "the upstream credential that owns previous_response_id is unavailable",
+	}
+}
+
+func previousResponseAffinityID(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	return normalizedSessionCandidate(gjson.GetBytes(payload, "previous_response_id").String())
+}
+
+func responseAffinityCacheKey(provider, responseID, model string) string {
+	return provider + "::response:" + responseID + "::" + canonicalModelKey(model)
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -775,8 +869,13 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 	if s == nil || s.cache == nil || res.AuthID == "" {
 		return
 	}
+	if status, _ := res.Options.Metadata[cliproxyexecutor.SessionAffinityStatusMetadataKey].(string); status == "disabled" {
+		return
+	}
 	primaryID, fallbackID := extractSessionIDs(res.Options.Headers, res.Options.OriginalRequest, res.Options.Metadata)
-	if primaryID == "" && fallbackID == "" {
+	responseID, _ := res.Options.Metadata[cliproxyexecutor.ResponseAffinityIDMetadataKey].(string)
+	responseID = normalizedSessionCandidate(responseID)
+	if primaryID == "" && fallbackID == "" && responseID == "" {
 		return
 	}
 
@@ -795,9 +894,14 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
-		s.cache.Touch(cacheKey, res.AuthID)
+		if primaryID != "" {
+			s.cache.Touch(cacheKey, res.AuthID)
+		}
 		if fallbackKey != "" {
 			s.cache.Touch(fallbackKey, res.AuthID)
+		}
+		if responseID != "" {
+			s.cache.Set(responseAffinityCacheKey(ns, responseID, nsModel), res.AuthID)
 		}
 		return
 	}
@@ -806,7 +910,9 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		return
 	}
 
-	s.cache.CompareAndDelete(cacheKey, res.AuthID)
+	if primaryID != "" {
+		s.cache.CompareAndDelete(cacheKey, res.AuthID)
+	}
 	if fallbackKey != "" {
 		s.cache.CompareAndDelete(fallbackKey, res.AuthID)
 	}

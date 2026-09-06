@@ -444,15 +444,24 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		return nil, errors.New("auth id is empty")
 	}
 
+	lock := m.credentialRefreshLock(id)
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+	return m.refreshAuthForRequestLocked(ctx, id, failedAccessToken)
+}
+
+func (m *Manager) credentialRefreshLock(id string) *authRefreshLock {
 	lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
 	lock, _ := lockValue.(*authRefreshLock)
 	if lock == nil {
 		lock = &authRefreshLock{}
 		m.refreshLocks.Store(id, lock)
 	}
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
+	return lock
+}
 
+// The caller must hold the credential's refresh lock.
+func (m *Manager) refreshAuthForRequestLocked(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor

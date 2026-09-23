@@ -113,14 +113,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.authEpochs[auth.ID]++
 	auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	auth.Generation = 1
-	authClone := auth.Clone()
-	m.auths[auth.ID] = authClone
+	// Keep the post-lock callbacks isolated from live request-result updates.
+	auth = auth.Clone()
+	m.auths[auth.ID] = auth.Clone()
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone.Clone())
+		m.scheduler.upsertAuth(auth.Clone())
 	}
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
@@ -259,14 +260,15 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			return nil, fmt.Errorf("persist meta auth: %w", errPersist)
 		}
 	}
-	authClone := auth.Clone()
-	m.auths[auth.ID] = authClone
+	// Detach merged model state before publishing it to concurrent requests.
+	auth = auth.Clone()
+	m.auths[auth.ID] = auth.Clone()
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone.Clone())
+		m.scheduler.upsertAuth(auth.Clone())
 	}
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
